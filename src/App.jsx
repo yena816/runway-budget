@@ -99,26 +99,52 @@ function periodLabel(period) {
 
 // Every recurring-bill occurrence landing within an arbitrary [from, to] day
 // range (Date objects, inclusive) — used for paycheck-period spans that
-// don't line up with calendar month boundaries.
+// don't line up with calendar month boundaries. Handles both "monthly"
+// (day-of-month) and "weekly"/"biweekly" (stepped from an anchor date) bills.
 function recurringOccurrencesBetween(recurring, from, to) {
   const out = [];
-  let y = from.getFullYear(), m = from.getMonth();
-  const endY = to.getFullYear(), endM = to.getMonth();
-  let guard = 0;
-  while ((y < endY || (y === endY && m <= endM)) && guard < 36) {
-    for (const bill of recurring) {
-      const day = Math.min(bill.day, daysInMonth(y, m));
-      const occ = new Date(y, m, day);
-      if (occ >= from && occ <= to) {
-        const startFrom = bill.startDate ? fromKey(bill.startDate) : null;
-        const endBefore = bill.endDate ? fromKey(bill.endDate) : null;
-        if ((!startFrom || occ >= startFrom) && (!endBefore || occ < endBefore)) out.push({ bill, date: toKey(occ) });
+  for (const bill of recurring) {
+    const startFrom = bill.startDate ? fromKey(bill.startDate) : null;
+    const endBefore = bill.endDate ? fromKey(bill.endDate) : null;
+    const inBounds = (d) => (!startFrom || d >= startFrom) && (!endBefore || d < endBefore);
+    const repeat = bill.repeat || "monthly";
+    if (repeat === "monthly") {
+      let y = from.getFullYear(), m = from.getMonth();
+      const endY = to.getFullYear(), endM = to.getMonth();
+      let guard = 0;
+      while ((y < endY || (y === endY && m <= endM)) && guard < 36) {
+        const occ = new Date(y, m, Math.min(bill.day, daysInMonth(y, m)));
+        if (occ >= from && occ <= to && inBounds(occ)) out.push({ bill, date: toKey(occ) });
+        m++; if (m > 11) { m = 0; y++; }
+        guard++;
+      }
+    } else {
+      const step = repeat === "weekly" ? 7 : 14;
+      let d = fromKey(bill.date);
+      if (d < from) {
+        const diffDays = Math.round((from - d) / 86400000);
+        d = addDays(d, Math.ceil(diffDays / step) * step);
+      }
+      let guard = 0;
+      while (d <= to && guard < 60) {
+        if (inBounds(d)) out.push({ bill, date: toKey(d) });
+        d = addDays(d, step);
+        guard++;
       }
     }
-    m++; if (m > 11) { m = 0; y++; }
-    guard++;
   }
   return out;
+}
+
+// A monthly bill's raw amount already is its monthly cost. A weekly or
+// biweekly bill isn't — it lands roughly 4.35 or 2.17 times a month on
+// average — so totals that add up "cost per month" (the Monthly bills stat,
+// "Total per month" below) need this instead of the raw per-occurrence amount.
+function monthlyEquivalent(bill) {
+  const repeat = bill.repeat || "monthly";
+  if (repeat === "monthly") return bill.amount;
+  const step = repeat === "weekly" ? 7 : 14;
+  return bill.amount * (30.4375 / step);
 }
 
 // Every one-time purchase, card purchase, and recurring-bill occurrence
@@ -153,7 +179,7 @@ function periodTransactionRows(data, period, todayStr, { capToday = false } = {}
     const billTo = capNow ? fromKey(todayStr) : (period.end ? addDays(fromKey(period.end), -1) : fromKey(todayStr));
     for (const { bill, date } of recurringOccurrencesBetween(data.recurring, billFrom, billTo)) {
       const cat = bill.category || "Uncategorized";
-      rows.push({ kind: "recurring", id: bill.id, date, category: cat, label: bill.name, amount: bill.amount, net: bill.amount });
+      rows.push({ kind: "recurring", id: bill.id, date, category: cat, label: bill.name, amount: bill.amount, net: netAmount(bill, "recurring", data.reimbursements) });
     }
   }
   return rows;
@@ -201,25 +227,45 @@ function buildProjection(data, horizonDays = 210, pastDays = 400) {
     pastDeltas[key].push({ amt, label, informational: true, ...extra });
   };
 
-  // Recurring bills: hit their day-of-month each month (clamped to month length),
-  // skipping any occurrence before an optional startDate or on/after an optional
-  // endDate (used when an amount edit is split into a past segment and a future one)
+  // Recurring bills: "monthly" ones hit their day-of-month each month
+  // (clamped to month length); "weekly"/"biweekly" ones step forward every
+  // 7/14 days from an anchor date (bill.date), same pattern as paychecks.
+  // Both skip any occurrence before an optional startDate or on/after an
+  // optional endDate (used when an amount edit is split into a past segment
+  // and a future one).
   for (const r of data.recurring) {
     const startFrom = r.startDate ? fromKey(r.startDate) : null;
     const endBefore = r.endDate ? fromKey(r.endDate) : null;
-    let y = rangeStart.getFullYear(), m = rangeStart.getMonth();
-    for (let i = 0; i < Math.ceil((horizonDays + pastDays) / 28) + 3; i++) {
-      const day = Math.min(r.day, daysInMonth(y, m));
-      const d = new Date(y, m, day);
-      if (d >= rangeStart && d <= end && (!startFrom || d >= startFrom) && (!endBefore || d < endBefore)) {
-        const key = toKey(d);
-        const ov = findOverride(data.recurringOverrides, r.id, key);
-        const amt = ov ? ov.amount : r.amount;
-        const extra = { sourceType: "recurring", sourceId: r.id, overridden: !!ov };
-        if (d > start) add(key, -amt, r.name, extra);
-        else if (d < start) addPast(key, -amt, r.name, extra);
+    const repeat = r.repeat || "monthly";
+    const emit = (d) => {
+      if (d < rangeStart || d > end) return;
+      if ((startFrom && d < startFrom) || (endBefore && d >= endBefore)) return;
+      const key = toKey(d);
+      const ov = findOverride(data.recurringOverrides, r.id, key);
+      const amt = ov ? ov.amount : r.amount;
+      const extra = { sourceType: "recurring", sourceId: r.id, overridden: !!ov };
+      if (d > start) add(key, -amt, r.name, extra);
+      else if (d < start) addPast(key, -amt, r.name, extra);
+    };
+    if (repeat === "monthly") {
+      let y = rangeStart.getFullYear(), m = rangeStart.getMonth();
+      for (let i = 0; i < Math.ceil((horizonDays + pastDays) / 28) + 3; i++) {
+        emit(new Date(y, m, Math.min(r.day, daysInMonth(y, m))));
+        m++; if (m > 11) { m = 0; y++; }
       }
-      m++; if (m > 11) { m = 0; y++; }
+    } else {
+      const step = repeat === "weekly" ? 7 : 14;
+      let d = fromKey(r.date);
+      if (d < rangeStart) {
+        const diffDays = Math.round((rangeStart - d) / 86400000);
+        d = addDays(d, Math.ceil(diffDays / step) * step);
+      }
+      let guard = 0;
+      while (d <= end && guard < 200) {
+        emit(d);
+        d = addDays(d, step);
+        guard++;
+      }
     }
   }
 
@@ -645,7 +691,7 @@ function Dashboard({ data, update, projection, goTo }) {
   const monthSpend = monthExpenses.reduce((s, e) => s + e.net, 0) + monthCardTx.reduce((s, t) => s + t.net, 0);
   const monthPurchaseCount = monthExpenses.length + monthCardTx.length;
   const activeRecurring = data.recurring.filter((r) => !r.endDate || r.endDate > todayKey());
-  const recurringTotal = activeRecurring.reduce((s, r) => s + r.amount, 0);
+  const recurringTotal = activeRecurring.reduce((s, r) => s + monthlyEquivalent(r), 0);
 
   const todayStr = todayKey();
 
@@ -887,9 +933,7 @@ function Dashboard({ data, update, projection, goTo }) {
                             </div>
                             <Mono className="shrink-0 text-sm font-semibold text-red-400">{fmtMoney(-row.amount, true)}</Mono>
                           </div>
-                          {row.kind !== "recurring" && (
-                            <ReimbursementManager targetKind={row.kind} targetId={row.id} amount={row.amount} data={data} update={update} />
-                          )}
+                          <ReimbursementManager targetKind={row.kind} targetId={row.id} amount={row.amount} data={data} update={update} />
                         </li>
                       ))}
                     </ul>
@@ -1377,23 +1421,35 @@ function ImportReviewQueue({ rows, setRows, data, onCommit, onCancel }) {
   );
 }
 
+// A recurring bill's "when" caption: day-of-month for monthly, or the
+// cadence + anchor date for weekly/biweekly ones.
+function recurringScheduleLabel(r) {
+  const repeat = r.repeat || "monthly";
+  if (repeat === "monthly") return `day ${r.day} of each month`;
+  return `${repeat === "weekly" ? "every week" : "every 2 weeks"} from ${niceDate(r.date)}`;
+}
+
 function RecurringSection({ data, update, categories }) {
   const [name, setName] = useState("");
   const [amount, setAmount] = useState("");
+  const [repeat, setRepeat] = useState("monthly");
   const [day, setDay] = useState("1");
+  const [date, setDate] = useState(todayKey());
   const [startDate, setStartDate] = useState("");
   const [category, setCategory] = useState("");
   const [note, setNote] = useState("");
-  const valid = name.trim() && parseFloat(amount) > 0 && +day >= 1 && +day <= 31;
+  const valid = name.trim() && parseFloat(amount) > 0 && (repeat === "monthly" ? (+day >= 1 && +day <= 31) : !!date);
 
   const [editingId, setEditingId] = useState(null);
   const [editName, setEditName] = useState("");
   const [editAmount, setEditAmount] = useState("");
+  const [editRepeat, setEditRepeat] = useState("monthly");
   const [editDay, setEditDay] = useState("1");
+  const [editDate, setEditDate] = useState(todayKey());
   const [editStartDate, setEditStartDate] = useState("");
   const [editCategory, setEditCategory] = useState("");
   const [editNote, setEditNote] = useState("");
-  const editValid = editName.trim() && parseFloat(editAmount) > 0 && +editDay >= 1 && +editDay <= 31;
+  const editValid = editName.trim() && parseFloat(editAmount) > 0 && (editRepeat === "monthly" ? (+editDay >= 1 && +editDay <= 31) : !!editDate);
 
   // Bills whose amount was edited get split into a past segment (endDate set)
   // and a fresh ongoing one — only the ongoing one is shown for management.
@@ -1402,33 +1458,55 @@ function RecurringSection({ data, update, categories }) {
   const addItem = () => {
     update((d) => ({
       ...d,
-      recurring: [...d.recurring, { id: uid(), name: name.trim(), amount: parseFloat(amount), day: +day, startDate: startDate || null, category: category.trim(), note: note.trim() }],
+      recurring: [...d.recurring, {
+        id: uid(), name: name.trim(), amount: parseFloat(amount), repeat,
+        day: repeat === "monthly" ? +day : null,
+        date: repeat === "monthly" ? null : date,
+        startDate: repeat === "monthly" ? (startDate || null) : null,
+        category: category.trim(), note: note.trim(),
+      }],
     }));
     setName(""); setAmount(""); setStartDate(""); setCategory(""); setNote("");
   };
 
   const startEdit = (r) => {
-    setEditingId(r.id); setEditName(r.name); setEditAmount(String(r.amount)); setEditDay(String(r.day)); setEditStartDate(r.startDate || ""); setEditCategory(r.category || ""); setEditNote(r.note || "");
+    const rep = r.repeat || "monthly";
+    setEditingId(r.id); setEditName(r.name); setEditAmount(String(r.amount)); setEditRepeat(rep);
+    setEditDay(String(r.day || 1)); setEditDate(r.date || todayKey()); setEditStartDate(r.startDate || "");
+    setEditCategory(r.category || ""); setEditNote(r.note || "");
   };
   const cancelEdit = () => setEditingId(null);
   const saveEdit = (id) => {
     update((d) => {
       const original = d.recurring.find((x) => x.id === id);
       const newAmount = parseFloat(editAmount);
-      const edited = { name: editName.trim(), amount: newAmount, day: +editDay, startDate: editStartDate || null, category: editCategory.trim(), note: editNote.trim() };
+      const edited = {
+        name: editName.trim(), amount: newAmount, repeat: editRepeat,
+        day: editRepeat === "monthly" ? +editDay : null,
+        date: editRepeat === "monthly" ? null : editDate,
+        startDate: editRepeat === "monthly" ? (editStartDate || null) : null,
+        category: editCategory.trim(), note: editNote.trim(),
+      };
 
       // Changing the amount only affects payments from today onward — past
       // occurrences already happened at the old amount. So instead of
       // mutating the rule in place, cap the old rule at today and start a
       // fresh one (with the new amount) from today, unless the bill hasn't
       // started yet, in which case there's no history to preserve.
-      const hasHistory = original && (!original.startDate || original.startDate <= todayKey());
+      const origRepeat = original ? (original.repeat || "monthly") : "monthly";
+      const anchorPassed = !original || origRepeat === "monthly" || original.date <= todayKey();
+      const hasHistory = original && anchorPassed && (!original.startDate || original.startDate <= todayKey());
       if (original && newAmount !== original.amount && hasHistory) {
         return {
           ...d,
           recurring: [
             ...d.recurring.map((x) => x.id === id ? { ...x, endDate: todayKey() } : x),
-            { id: uid(), ...edited, startDate: todayKey() },
+            // The new segment always gets startDate: todayKey() here, regardless
+            // of what `edited.startDate` holds — for a non-monthly bill that's
+            // null (reserved for this split mechanism), and it must be set to
+            // today or the new segment would also regenerate the same past
+            // occurrences the old (now-capped) segment already covers.
+            { id: uid(), ...edited, startDate: todayKey(), endDate: null },
           ],
         };
       }
@@ -1442,7 +1520,9 @@ function RecurringSection({ data, update, categories }) {
   // without erasing the ones that already happened — so this caps it at
   // today rather than deleting the record, unless it never actually started.
   const cancelItem = (r) => {
-    const hasHistory = !r.startDate || r.startDate <= todayKey();
+    const repeat = r.repeat || "monthly";
+    const anchorPassed = repeat === "monthly" || r.date <= todayKey();
+    const hasHistory = anchorPassed && (!r.startDate || r.startDate <= todayKey());
     update((d) => ({
       ...d,
       recurring: hasHistory
@@ -1452,43 +1532,79 @@ function RecurringSection({ data, update, categories }) {
   };
 
   return (
-    <Card title="Recurring monthly bills">
-      <div className="mb-4 grid grid-cols-1 gap-2 sm:grid-cols-[1fr_100px_75px_130px_130px_auto] sm:items-end">
+    <Card title="Recurring bills">
+      <div className="mb-4 space-y-2">
         <Field label="Bill"><input className={inputCls} placeholder="Rent, Netflix, car insurance…" value={name} onChange={(e) => setName(e.target.value)} /></Field>
-        <Field label="Amount"><input className={inputCls} type="number" min="0" step="0.01" placeholder="0.00" value={amount} onChange={(e) => setAmount(e.target.value)} /></Field>
-        <Field label="Day"><input className={inputCls} type="number" min="1" max="31" value={day} onChange={(e) => setDay(e.target.value)} /></Field>
-        <Field label="Category (optional)">
-          <input className={inputCls} list="recurring-cat-options" placeholder="Housing, Subscriptions…" value={category} onChange={(e) => setCategory(e.target.value)} />
-          <datalist id="recurring-cat-options">{categories.map((c) => <option key={c} value={c} />)}</datalist>
-        </Field>
-        <Field label="Starts on (optional)">
-          <input className={inputCls} type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} />
-        </Field>
-        <button className={btnPrimary} disabled={!valid} onClick={addItem}>Add bill</button>
-        <div className="sm:col-span-6"><NoteField value={note} onChange={(e) => setNote(e.target.value)} /></div>
+        <div className="grid grid-cols-1 gap-2 sm:grid-cols-[100px_120px_120px_130px_auto] sm:items-end">
+          <Field label="Amount"><input className={inputCls} type="number" min="0" step="0.01" placeholder="0.00" value={amount} onChange={(e) => setAmount(e.target.value)} /></Field>
+          <Field label="Repeats">
+            <select className={inputCls} value={repeat} onChange={(e) => setRepeat(e.target.value)}>
+              <option value="monthly">Monthly</option>
+              <option value="biweekly">Every 2 weeks</option>
+              <option value="weekly">Every week</option>
+            </select>
+          </Field>
+          {repeat === "monthly" ? (
+            <Field label="Day"><input className={inputCls} type="number" min="1" max="31" value={day} onChange={(e) => setDay(e.target.value)} /></Field>
+          ) : (
+            <Field label="Next due date"><input className={inputCls} type="date" value={date} onChange={(e) => setDate(e.target.value)} /></Field>
+          )}
+          <Field label="Category (optional)">
+            <input className={inputCls} list="recurring-cat-options" placeholder="Housing, Subscriptions…" value={category} onChange={(e) => setCategory(e.target.value)} />
+            <datalist id="recurring-cat-options">{categories.map((c) => <option key={c} value={c} />)}</datalist>
+          </Field>
+          <button className={btnPrimary} disabled={!valid} onClick={addItem}>Add bill</button>
+          {repeat === "monthly" && (
+            <div className="sm:col-span-2">
+              <Field label="Starts on (optional)">
+                <input className={inputCls} type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} />
+              </Field>
+            </div>
+          )}
+        </div>
+        <NoteField value={note} onChange={(e) => setNote(e.target.value)} />
       </div>
       {activeRecurring.length === 0 ? (
-        <Empty>No recurring bills yet. Rent, subscriptions, insurance — anything that goes out every month.</Empty>
+        <Empty>No recurring bills yet. Rent, subscriptions, insurance — anything that goes out every month or every 2 weeks.</Empty>
       ) : (
         <ul className="divide-y divide-stone-800">
-          {[...activeRecurring].sort((a, b) => a.day - b.day).map((r) => (
+          {[...activeRecurring]
+            .sort((a, b) => ((a.repeat && a.repeat !== "monthly") ? fromKey(a.date).getDate() : a.day) - ((b.repeat && b.repeat !== "monthly") ? fromKey(b.date).getDate() : b.day))
+            .map((r) => (
             <li key={r.id} className="py-2">
               {editingId === r.id ? (
-                <div className="grid grid-cols-1 gap-2 sm:grid-cols-[1fr_100px_75px_130px_130px_auto] sm:items-end">
+                <div className="space-y-2">
                   <Field label="Bill"><input className={inputCls} value={editName} onChange={(e) => setEditName(e.target.value)} /></Field>
-                  <Field label="Amount"><input className={inputCls} type="number" min="0" step="0.01" value={editAmount} onChange={(e) => setEditAmount(e.target.value)} /></Field>
-                  <Field label="Day"><input className={inputCls} type="number" min="1" max="31" value={editDay} onChange={(e) => setEditDay(e.target.value)} /></Field>
-                  <Field label="Category (optional)">
-                    <input className={inputCls} list="recurring-cat-options" value={editCategory} onChange={(e) => setEditCategory(e.target.value)} />
-                  </Field>
-                  <Field label="Starts on (optional)">
-                    <input className={inputCls} type="date" value={editStartDate} onChange={(e) => setEditStartDate(e.target.value)} />
-                  </Field>
-                  <div className="flex gap-2">
-                    <button className={btnPrimary} disabled={!editValid} onClick={() => saveEdit(r.id)}>Save</button>
-                    <button className={btnGhost} onClick={cancelEdit}>Cancel</button>
+                  <div className="grid grid-cols-1 gap-2 sm:grid-cols-[100px_120px_120px_130px_auto] sm:items-end">
+                    <Field label="Amount"><input className={inputCls} type="number" min="0" step="0.01" value={editAmount} onChange={(e) => setEditAmount(e.target.value)} /></Field>
+                    <Field label="Repeats">
+                      <select className={inputCls} value={editRepeat} onChange={(e) => setEditRepeat(e.target.value)}>
+                        <option value="monthly">Monthly</option>
+                        <option value="biweekly">Every 2 weeks</option>
+                        <option value="weekly">Every week</option>
+                      </select>
+                    </Field>
+                    {editRepeat === "monthly" ? (
+                      <Field label="Day"><input className={inputCls} type="number" min="1" max="31" value={editDay} onChange={(e) => setEditDay(e.target.value)} /></Field>
+                    ) : (
+                      <Field label="Next due date"><input className={inputCls} type="date" value={editDate} onChange={(e) => setEditDate(e.target.value)} /></Field>
+                    )}
+                    <Field label="Category (optional)">
+                      <input className={inputCls} list="recurring-cat-options" value={editCategory} onChange={(e) => setEditCategory(e.target.value)} />
+                    </Field>
+                    <div className="flex gap-2">
+                      <button className={btnPrimary} disabled={!editValid} onClick={() => saveEdit(r.id)}>Save</button>
+                      <button className={btnGhost} onClick={cancelEdit}>Cancel</button>
+                    </div>
+                    {editRepeat === "monthly" && (
+                      <div className="sm:col-span-2">
+                        <Field label="Starts on (optional)">
+                          <input className={inputCls} type="date" value={editStartDate} onChange={(e) => setEditStartDate(e.target.value)} />
+                        </Field>
+                      </div>
+                    )}
                   </div>
-                  <div className="sm:col-span-6"><NoteField value={editNote} onChange={(e) => setEditNote(e.target.value)} /></div>
+                  <NoteField value={editNote} onChange={(e) => setEditNote(e.target.value)} />
                 </div>
               ) : (
                 <div className="flex items-center justify-between gap-3">
@@ -1496,8 +1612,10 @@ function RecurringSection({ data, update, categories }) {
                     <div className="truncate text-sm font-medium">{r.name}</div>
                     <div className="text-xs text-stone-400">
                       {r.category && <span className="mr-1 inline-block rounded bg-emerald-900/40 px-1.5 py-0.5 text-[11px] font-medium text-emerald-300">{r.category}</span>}
-                      day {r.day} of each month
-                      {r.startDate && r.startDate > todayKey() && <span className="ml-1 text-amber-400">· starts {niceDate(r.startDate)}</span>}
+                      {recurringScheduleLabel(r)}
+                      {(r.repeat || "monthly") === "monthly"
+                        ? (r.startDate && r.startDate > todayKey() && <span className="ml-1 text-amber-400">· starts {niceDate(r.startDate)}</span>)
+                        : (r.date > todayKey() && <span className="ml-1 text-amber-400">· starts {niceDate(r.date)}</span>)}
                     </div>
                     <NoteLine note={r.note} />
                   </div>
@@ -1508,18 +1626,23 @@ function RecurringSection({ data, update, categories }) {
                     <button
                       className={btnGhost}
                       title="Delete this bill completely, including past history — use this only if you added it by mistake"
-                      onClick={() => update((d) => ({ ...d, recurring: d.recurring.filter((x) => x.id !== r.id) }))}
+                      onClick={() => update((d) => ({
+                        ...d,
+                        recurring: d.recurring.filter((x) => x.id !== r.id),
+                        reimbursements: (d.reimbursements || []).filter((rb) => !(rb.targetKind === "recurring" && rb.targetId === r.id)),
+                      }))}
                     >
                       Delete
                     </button>
                   </div>
                 </div>
               )}
+              {editingId !== r.id && <ReimbursementManager targetKind="recurring" targetId={r.id} amount={r.amount} data={data} update={update} />}
             </li>
           ))}
           <li className="flex items-center justify-between pt-3 text-sm font-semibold">
             <span>Total per month</span>
-            <Mono>{fmtMoney(activeRecurring.reduce((s, r) => s + r.amount, 0))}</Mono>
+            <Mono>{fmtMoney(activeRecurring.reduce((s, r) => s + monthlyEquivalent(r), 0))}</Mono>
           </li>
         </ul>
       )}
@@ -2626,9 +2749,13 @@ function buildFinancialContext(data, projection) {
   return {
     today: todayKey(),
     currentBalance: data.balanceAsOf ? { amount: data.balance, asOf: data.balanceAsOf } : null,
-    recurringMonthlyBills: data.recurring
+    recurringBills: data.recurring
       .filter((r) => !r.endDate || r.endDate > todayKey())
-      .map((r) => ({ name: r.name, amount: r.amount, dayOfMonth: r.day, startsOn: r.startDate || "immediately", note: r.note || undefined })),
+      .map((r) => ({
+        name: r.name, amount: r.amount, repeats: r.repeat || "monthly",
+        ...(((r.repeat || "monthly") === "monthly") ? { dayOfMonth: r.day, startsOn: r.startDate || "immediately" } : { anchorDate: r.date }),
+        note: r.note || undefined,
+      })),
     incomeEntries: data.paychecks
       .filter((p) => !p.endDate || p.endDate > todayKey())
       .map((p) => ({ source: p.source, amount: p.amount, startDate: p.date, repeats: p.repeat, note: p.note || undefined })),
