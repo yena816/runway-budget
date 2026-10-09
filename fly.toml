@@ -1,21 +1,28 @@
-# Generated for manual deploy — see the "Deploying to Fly.io" section in
-# README.md for the full runbook. Fill in `app` and `primary_region` when you
-# run `fly launch` (it will offer to write them in for you).
-app = ""
-primary_region = ""
+# fly.toml app configuration file generated for runway-budget on 2026-10-09T11:24:58-04:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'runway-budget'
+primary_region = 'iad'
 
 [build]
-
 [env]
-  DATA_DIR = "/data"
+  DATA_DIR = '/data'
 
 [[mounts]]
-  source = "runway_data"
-  destination = "/data"
+  source = 'runway_data'
+  destination = '/data'
 
 [http_service]
   internal_port = 3000
   force_https = true
-  auto_stop_machines = false
+  auto_stop_machines = 'off'
   auto_start_machines = true
   min_machines_running = 1
+
+[[vm]]
+  memory = '1gb'
+  cpu_kind = 'shared'
+  cpus = 1
+  memory_mb = 1024
