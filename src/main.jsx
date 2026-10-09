@@ -28,24 +28,8 @@ window.storage = {
   },
 };
 
-// One-time migration: if this browser still has data from the earlier
-// localStorage-based version and the server has none yet, move it over.
-async function migrateOldData() {
-  const old = localStorage.getItem("runway:budget-app-v1");
-  if (!old) return;
-  try {
-    await window.storage.get("budget-app-v1"); // server already has data — leave it
-  } catch {
-    await window.storage.set("budget-app-v1", old);
-    console.log("Migrated your existing budget data to the server.");
-  }
-  localStorage.removeItem("runway:budget-app-v1");
-}
-
-migrateOldData().finally(() => {
-  ReactDOM.createRoot(document.getElementById("root")).render(
-    <React.StrictMode>
-      <App />
-    </React.StrictMode>
-  );
-});
+ReactDOM.createRoot(document.getElementById("root")).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+);

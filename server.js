@@ -1,12 +1,16 @@
 // Runway local server
 // - Serves the built app (dist/)
-// - /api/storage/* : saves your budget data to data.json on this computer,
-//   so every device (laptop, phone) sees the same numbers
-// - /api/chat : forwards chat requests to the Anthropic API, adding your key
-//   from .env — the key never leaves this machine
+// - /api/storage/* : saves your budget data to data.json (DATA_DIR if set,
+//   otherwise this computer) — so every device sees the same numbers
+// - /api/chat, /api/parse-statements : forward requests to the Anthropic
+//   API, adding your key from .env/secrets — the key never reaches the client
+// - /api/login, /api/logout, /api/session : a single-password gate (see
+//   below) protecting all of the above once this is reachable from the
+//   internet, not just your own machine
 import express from "express";
 import fs from "fs";
 import path from "path";
+import crypto from "crypto";
 
 // Minimal .env loader (no dependency needed)
 try {
@@ -16,8 +20,16 @@ try {
   }
 } catch {}
 
+if (!process.env.APP_PASSWORD || !process.env.SESSION_SECRET) {
+  console.error(
+    "Missing APP_PASSWORD or SESSION_SECRET. Copy .env.example to .env, " +
+    "set both (SESSION_SECRET can be anything random, e.g. `openssl rand -hex 32`), and restart."
+  );
+  process.exit(1);
+}
+
 const PORT = process.env.PORT || 3000;
-const DATA_FILE = path.join(process.cwd(), "data.json");
+const DATA_FILE = path.join(process.env.DATA_DIR || process.cwd(), "data.json");
 
 const readStore = () => {
   try { return JSON.parse(fs.readFileSync(DATA_FILE, "utf8")); }
@@ -25,32 +37,116 @@ const readStore = () => {
 };
 const writeStore = (s) => fs.writeFileSync(DATA_FILE, JSON.stringify(s, null, 2));
 
+/* ---------------- auth: single shared password, signed-cookie session ---
+ * No session store, no extra dependency — the cookie is just an expiry
+ * timestamp plus an HMAC signature (keyed by SESSION_SECRET), so it's
+ * self-verifying and survives server restarts. */
+const SESSION_COOKIE = "runway_session";
+const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+
+function signToken(expiresAt) {
+  const sig = crypto.createHmac("sha256", process.env.SESSION_SECRET).update(String(expiresAt)).digest("hex");
+  return `${expiresAt}.${sig}`;
+}
+function verifyToken(token) {
+  if (!token) return false;
+  const [expiresAt, sig] = token.split(".");
+  if (!expiresAt || !sig) return false;
+  const expectedSig = crypto.createHmac("sha256", process.env.SESSION_SECRET).update(expiresAt).digest("hex");
+  const sigBuf = Buffer.from(sig, "hex");
+  const expectedBuf = Buffer.from(expectedSig, "hex");
+  if (sigBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(sigBuf, expectedBuf)) return false;
+  return Number(expiresAt) > Date.now();
+}
+function parseCookies(header) {
+  const out = {};
+  if (!header) return out;
+  for (const part of header.split(";")) {
+    const idx = part.indexOf("=");
+    if (idx === -1) continue;
+    out[part.slice(0, idx).trim()] = decodeURIComponent(part.slice(idx + 1).trim());
+  }
+  return out;
+}
+function setSessionCookie(req, res) {
+  const token = signToken(Date.now() + SESSION_TTL_MS);
+  const attrs = [`${SESSION_COOKIE}=${encodeURIComponent(token)}`, "HttpOnly", "Path=/", "SameSite=Lax", `Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}`];
+  if (req.secure) attrs.push("Secure"); // only over HTTPS — omitted for local http://localhost
+  res.setHeader("Set-Cookie", attrs.join("; "));
+}
+function clearSessionCookie(res) {
+  res.setHeader("Set-Cookie", `${SESSION_COOKIE}=; HttpOnly; Path=/; Max-Age=0`);
+}
+function requireAuth(req, res, next) {
+  if (verifyToken(parseCookies(req.headers.cookie)[SESSION_COOKIE])) return next();
+  res.status(401).json({ error: { message: "Not logged in." } });
+}
+
+// Crude in-memory rate limit on login attempts — resets on restart, which
+// is fine for a single-user app; just deters casual password guessing.
+const loginAttempts = new Map();
+const LOGIN_MAX_ATTEMPTS = 10;
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+function isRateLimited(ip) {
+  const now = Date.now();
+  const entry = loginAttempts.get(ip);
+  if (!entry || now > entry.resetAt) {
+    loginAttempts.set(ip, { count: 1, resetAt: now + LOGIN_WINDOW_MS });
+    return false;
+  }
+  entry.count++;
+  return entry.count > LOGIN_MAX_ATTEMPTS;
+}
+
 const app = express();
+app.set("trust proxy", 1); // needed behind Fly's edge: real client IP + req.secure from X-Forwarded-*
 // 30mb: statement PDFs are sent as base64, and a batch upload can include
 // several at once, well under Anthropic's 32MB per-request document limit.
 app.use(express.json({ limit: "30mb" }));
 
-app.get("/api/storage/:key", (req, res) => {
+app.post("/api/login", (req, res) => {
+  if (isRateLimited(req.ip)) {
+    return res.status(429).json({ error: { message: "Too many attempts. Try again in a bit." } });
+  }
+  const password = typeof req.body?.password === "string" ? req.body.password : "";
+  const expected = process.env.APP_PASSWORD;
+  const ok = Buffer.byteLength(password) === Buffer.byteLength(expected)
+    && crypto.timingSafeEqual(Buffer.from(password), Buffer.from(expected));
+  if (!ok) return res.status(401).json({ error: { message: "Wrong password." } });
+  setSessionCookie(req, res);
+  res.json({ ok: true });
+});
+
+app.post("/api/logout", (req, res) => {
+  clearSessionCookie(res);
+  res.json({ ok: true });
+});
+
+app.get("/api/session", (req, res) => {
+  res.json({ authenticated: verifyToken(parseCookies(req.headers.cookie)[SESSION_COOKIE]) });
+});
+
+app.get("/api/storage/:key", requireAuth, (req, res) => {
   const store = readStore();
   if (!(req.params.key in store)) return res.status(404).json({ error: "not found" });
   res.json({ key: req.params.key, value: store[req.params.key] });
 });
 
-app.put("/api/storage/:key", (req, res) => {
+app.put("/api/storage/:key", requireAuth, (req, res) => {
   const store = readStore();
   store[req.params.key] = req.body.value;
   writeStore(store);
   res.json({ key: req.params.key, value: req.body.value });
 });
 
-app.delete("/api/storage/:key", (req, res) => {
+app.delete("/api/storage/:key", requireAuth, (req, res) => {
   const store = readStore();
   delete store[req.params.key];
   writeStore(store);
   res.json({ key: req.params.key, deleted: true });
 });
 
-app.post("/api/chat", async (req, res) => {
+app.post("/api/chat", requireAuth, async (req, res) => {
   const key = process.env.ANTHROPIC_API_KEY;
   if (!key) {
     return res.status(500).json({
@@ -117,7 +213,7 @@ const STATEMENT_SCHEMA = {
   additionalProperties: false,
 };
 
-app.post("/api/parse-statements", async (req, res) => {
+app.post("/api/parse-statements", requireAuth, async (req, res) => {
   const key = process.env.ANTHROPIC_API_KEY;
   if (!key) {
     return res.status(500).json({
@@ -188,7 +284,7 @@ app.post("/api/parse-statements", async (req, res) => {
 app.use(express.static("dist"));
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Runway is running.`);
+  console.log(`Runway is running (password-protected).`);
   console.log(`  On this computer: http://localhost:${PORT}`);
   console.log(`  From your phone (via Tailscale): http://<your-machine-name>:${PORT}`);
 });

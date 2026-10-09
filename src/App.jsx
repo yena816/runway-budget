@@ -475,6 +475,20 @@ async function saveData(data) {
   catch (e) { console.error("Save failed", e); }
 }
 
+// One-time migration: if this browser still has data from the earlier
+// localStorage-based version and the server has none yet, move it over.
+async function migrateOldData() {
+  const old = localStorage.getItem("runway:budget-app-v1");
+  if (!old) return;
+  try {
+    await window.storage.get("budget-app-v1"); // server already has data — leave it
+  } catch {
+    await window.storage.set("budget-app-v1", old);
+    console.log("Migrated your existing budget data to the server.");
+  }
+  localStorage.removeItem("runway:budget-app-v1");
+}
+
 /* ---------------- shared bits ---------------- */
 
 const CHART_COLORS = ["#34D399", "#38BDF8", "#FB923C", "#A78BFA", "#F87171", "#2DD4BF", "#FBBF24", "#60A5FA", "#F472B6", "#A3E635"];
@@ -527,14 +541,92 @@ function NoteLine({ note }) {
   return <div className="mt-0.5 truncate text-xs italic text-stone-500">{note}</div>;
 }
 
+/* ---------------- auth gate ---------------- */
+
+// Checked once on load: shows LoginScreen until the server confirms a valid
+// session cookie, so the budget data is never fetched (and never flashes
+// empty) before the password has been entered.
+export default function App() {
+  const [authed, setAuthed] = useState(null); // null = checking
+
+  useEffect(() => {
+    fetch("/api/session")
+      .then((r) => r.json())
+      .then((d) => setAuthed(!!d.authenticated))
+      .catch(() => setAuthed(false));
+  }, []);
+
+  if (authed === null) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-stone-950">
+        <p className="text-sm text-stone-400">Loading…</p>
+      </div>
+    );
+  }
+  if (!authed) return <LoginScreen onSuccess={() => setAuthed(true)} />;
+  return <BudgetApp onLogout={() => setAuthed(false)} />;
+}
+
+function LoginScreen({ onSuccess }) {
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      const r = await fetch("/api/login", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ password }),
+      });
+      const body = await r.json();
+      if (!r.ok) {
+        setError(body?.error?.message || "Wrong password.");
+        return;
+      }
+      onSuccess();
+    } catch {
+      setError("Couldn't reach the server.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-stone-950 px-4" style={{ fontFamily: "'Inter', ui-sans-serif, system-ui, sans-serif" }}>
+      <style>{`@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500;600;700&display=swap');`}</style>
+      <form onSubmit={submit} className="w-full max-w-sm rounded-2xl border border-stone-800 bg-stone-900 p-6 shadow-sm shadow-black/20">
+        <h1 className="mb-1 text-xl font-bold tracking-tight" style={{ fontFamily: "'Space Grotesk', sans-serif" }}>Runway</h1>
+        <p className="mb-5 text-xs text-stone-500">your money, day by day</p>
+        <Field label="Password">
+          <input
+            type="password"
+            autoFocus
+            className={inputCls}
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+          />
+        </Field>
+        {error && <p className="mt-2 text-xs text-red-400">{error}</p>}
+        <button type="submit" disabled={busy || !password} className={btnPrimary + " mt-4 w-full"}>
+          {busy ? "Checking…" : "Log in"}
+        </button>
+      </form>
+    </div>
+  );
+}
+
 /* ---------------- main app ---------------- */
 
-export default function BudgetApp() {
+function BudgetApp({ onLogout }) {
   const [data, setData] = useState(null);
   const [tab, setTab] = useState("dashboard");
   const [chatMessages, setChatMessages] = useState([]);
 
-  useEffect(() => { loadData().then(setData); }, []);
+  useEffect(() => { migrateOldData().then(() => loadData().then(setData)); }, []);
 
   const update = (patch) => {
     setData((prev) => {
@@ -572,7 +664,15 @@ export default function BudgetApp() {
             <h1 className="text-xl font-bold tracking-tight" style={{ fontFamily: "'Space Grotesk', sans-serif" }}>Runway</h1>
             <span className="hidden text-xs text-stone-500 sm:inline">your money, day by day</span>
           </div>
-          <CurrentBalanceDisplay data={data} projection={projection} goTo={setTab} />
+          <div className="flex items-center gap-3">
+            <CurrentBalanceDisplay data={data} projection={projection} goTo={setTab} />
+            <button
+              onClick={() => fetch("/api/logout", { method: "POST" }).finally(onLogout)}
+              className="text-xs text-stone-500 hover:text-stone-300 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 rounded"
+            >
+              Log out
+            </button>
+          </div>
         </div>
         <nav className="mx-auto flex max-w-7xl gap-1 overflow-x-auto px-4 sm:px-6" aria-label="Sections">
           {tabs.map((t) => (

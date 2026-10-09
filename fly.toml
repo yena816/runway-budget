@@ -1,0 +1,21 @@
+# Generated for manual deploy — see the "Deploying to Fly.io" section in
+# README.md for the full runbook. Fill in `app` and `primary_region` when you
+# run `fly launch` (it will offer to write them in for you).
+app = ""
+primary_region = ""
+
+[build]
+
+[env]
+  DATA_DIR = "/data"
+
+[[mounts]]
+  source = "runway_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
