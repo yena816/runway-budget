@@ -2787,23 +2787,50 @@ function renderInline(text) {
   return parts;
 }
 
+const isBulletLine = (l) => /^\s*[-*]\s+/.test(l);
+const isNumberedLine = (l) => /^\s*\d+\.\s+/.test(l);
+const isHeaderLine = (l) => /^#{1,6}\s+/.test(l);
+const isHrLine = (l) => /^\s*([-*_])\1{2,}\s*$/.test(l);
+const isQuoteLine = (l) => /^\s*>\s?/.test(l);
+const isBlockStartLine = (l) => isBulletLine(l) || isNumberedLine(l) || isHeaderLine(l) || isHrLine(l) || isQuoteLine(l);
+
 function MessageContent({ text }) {
   const lines = text.split("\n");
   const blocks = [];
   let i = 0;
   while (i < lines.length) {
     if (lines[i].trim() === "") { i++; continue; }
-    if (/^\s*[-*]\s+/.test(lines[i])) {
+    if (isHeaderLine(lines[i])) {
+      const m = /^(#{1,6})\s+(.*)$/.exec(lines[i]);
+      const level = m[1].length;
+      blocks.push(
+        <div key={blocks.length} className={`${level <= 2 ? "text-base" : "text-sm"} mt-3 mb-1 font-bold first:mt-0`}>
+          {renderInline(m[2])}
+        </div>
+      );
+      i++;
+    } else if (isHrLine(lines[i])) {
+      blocks.push(<hr key={blocks.length} className="my-2 border-stone-600/60" />);
+      i++;
+    } else if (isQuoteLine(lines[i])) {
       const items = [];
-      while (i < lines.length && /^\s*[-*]\s+/.test(lines[i])) { items.push(lines[i].replace(/^\s*[-*]\s+/, "")); i++; }
+      while (i < lines.length && isQuoteLine(lines[i])) { items.push(lines[i].replace(/^\s*>\s?/, "")); i++; }
+      blocks.push(
+        <blockquote key={blocks.length} className="my-1 border-l-2 border-stone-600 pl-3 italic text-stone-400 first:mt-0 last:mb-0">
+          {items.map((l, idx) => <div key={idx}>{renderInline(l)}</div>)}
+        </blockquote>
+      );
+    } else if (isBulletLine(lines[i])) {
+      const items = [];
+      while (i < lines.length && isBulletLine(lines[i])) { items.push(lines[i].replace(/^\s*[-*]\s+/, "")); i++; }
       blocks.push(
         <ul key={blocks.length} className="my-1 list-disc space-y-0.5 pl-5 first:mt-0 last:mb-0">
           {items.map((it, idx) => <li key={idx}>{renderInline(it)}</li>)}
         </ul>
       );
-    } else if (/^\s*\d+\.\s+/.test(lines[i])) {
+    } else if (isNumberedLine(lines[i])) {
       const items = [];
-      while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) { items.push(lines[i].replace(/^\s*\d+\.\s+/, "")); i++; }
+      while (i < lines.length && isNumberedLine(lines[i])) { items.push(lines[i].replace(/^\s*\d+\.\s+/, "")); i++; }
       blocks.push(
         <ol key={blocks.length} className="my-1 list-decimal space-y-0.5 pl-5 first:mt-0 last:mb-0">
           {items.map((it, idx) => <li key={idx}>{renderInline(it)}</li>)}
@@ -2811,7 +2838,7 @@ function MessageContent({ text }) {
       );
     } else {
       const paraLines = [];
-      while (i < lines.length && lines[i].trim() !== "" && !/^\s*[-*]\s+/.test(lines[i]) && !/^\s*\d+\.\s+/.test(lines[i])) {
+      while (i < lines.length && lines[i].trim() !== "" && !isBlockStartLine(lines[i])) {
         paraLines.push(lines[i]); i++;
       }
       blocks.push(
@@ -2834,8 +2861,24 @@ function ChatTab({ data, projection, messages, setMessages }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
   const bottomRef = useRef(null);
+  const textareaRef = useRef(null);
 
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages, busy]);
+
+  // Grow the textarea to fit what's typed (up to a cap, then it scrolls
+  // internally) — runs whenever the text changes, including the resets
+  // after sending or restoring a failed message, so it shrinks back too.
+  // When empty, skip the scrollHeight measurement entirely and let the
+  // rows={1} default take over — Chrome factors the (long, wrapping)
+  // placeholder text into an empty textarea's scrollHeight, which would
+  // otherwise make the box look already-grown before anything is typed.
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    if (!input) { el.style.height = ""; return; }
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
+  }, [input]);
 
   const send = async (text) => {
     const question = (text ?? input).trim();
@@ -2926,13 +2969,15 @@ function ChatTab({ data, projection, messages, setMessages }) {
 
       {error && <p className="mt-2 text-xs text-red-400">{error}</p>}
 
-      <div className="mt-3 flex gap-2 border-t border-stone-800 pt-3">
-        <input
-          className={inputCls}
+      <div className="mt-3 flex items-end gap-2 border-t border-stone-800 pt-3">
+        <textarea
+          ref={textareaRef}
+          rows={1}
+          className={`${inputCls} resize-none overflow-y-auto leading-snug`}
           placeholder='Try: "I want to buy a $250 jacket — do I have enough?"'
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => { if (e.key === "Enter") send(); }}
+          onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
           disabled={busy}
         />
         <button className={btnPrimary} onClick={() => send()} disabled={busy || !input.trim()}>Send</button>
